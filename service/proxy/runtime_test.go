@@ -1614,6 +1614,78 @@ func TestRuntimeSyncMappingUpdatesDynamicGroupWithoutReplacingInstance(t *testin
 	}
 }
 
+func TestNodeBlacklistSyncRemovesNodeFromRuntimeGroup(t *testing.T) {
+	initProxyInMemoryDB(t)
+	t.Cleanup(func() {
+		_ = RuntimeStop()
+	})
+
+	ctx := context.Background()
+	portA := uint16(65021)
+	nodeA, err := NodeCreate(ctx, nil, NodeUpsertRequest{
+		Name:     "node-a",
+		Protocol: ProtocolSOCKS5,
+		Server:   "127.0.0.1",
+		Port:     &portA,
+	})
+	if err != nil {
+		t.Fatalf("NodeCreate(node-a) error = %v", err)
+	}
+	portB := uint16(65022)
+	nodeB, err := NodeCreate(ctx, nil, NodeUpsertRequest{
+		Name:     "node-b",
+		Protocol: ProtocolSOCKS5,
+		Server:   "127.0.0.1",
+		Port:     &portB,
+	})
+	if err != nil {
+		t.Fatalf("NodeCreate(node-b) error = %v", err)
+	}
+	mapping, err := MappingCreate(ctx, nil, MappingUpsertRequest{
+		Enabled:          true,
+		ListenAddress:    "127.0.0.1",
+		ListenPort:       freeTCPPort(t),
+		OutboundProtocol: OutboundProtocolMixed,
+		Strategy:         StrategyManual,
+		NodeIDs:          []string{nodeA.ID, nodeB.ID},
+		ActiveNodeID:     &nodeA.ID,
+	})
+	if err != nil {
+		t.Fatalf("MappingCreate() error = %v", err)
+	}
+	if _, err := RuntimeReload(ctx); err != nil {
+		t.Fatalf("RuntimeReload() error = %v", err)
+	}
+	instance := runtimeInstanceForMapping(mapping.ID)
+	if instance == nil || instance.core == nil {
+		t.Fatalf("runtime instance was not created")
+	}
+
+	before := runtimeInstanceForMapping(mapping.ID)
+	if _, err := NodeBlacklist(ctx, nodeA.ID, time.Minute); err != nil {
+		t.Fatalf("NodeBlacklist() error = %v", err)
+	}
+	after := runtimeInstanceForMapping(mapping.ID)
+	if before != after {
+		t.Fatalf("runtime instance was replaced during blacklist sync")
+	}
+
+	snapshot := after.core.Snapshot()
+	group := snapshotGroupByTag(snapshot.Groups, mappingOutboundTag(mapping.ID))
+	if group == nil {
+		t.Fatalf("mapping group missing after blacklist sync")
+	}
+	if containsRuntimeNode(group.Nodes, nodeA.ID) {
+		t.Fatalf("dynamic group still contains blacklisted node %q: %+v", nodeA.ID, group.Nodes)
+	}
+	if !containsRuntimeNode(group.Nodes, nodeB.ID) {
+		t.Fatalf("dynamic group nodes = %+v, want node-b", group.Nodes)
+	}
+	if group.Selected != nodeB.ID {
+		t.Fatalf("selected = %q, want %q", group.Selected, nodeB.ID)
+	}
+}
+
 func TestRuntimeLeastLatencyMappingIgnoresStoredActiveRoute(t *testing.T) {
 	initProxyInMemoryDB(t)
 	t.Cleanup(func() {
@@ -2585,6 +2657,15 @@ func runtimeRouteByTag(status RuntimeStatus, mappingID string, groupTag string) 
 		}
 	}
 	return nil
+}
+
+func containsRuntimeNode(nodes []singboxcore.NodeSnapshot, nodeID string) bool {
+	for _, node := range nodes {
+		if node.ID == nodeID {
+			return true
+		}
+	}
+	return false
 }
 
 func freeTCPPort(t *testing.T) uint16 {

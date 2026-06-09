@@ -91,20 +91,18 @@ func TestTombstoneDelayedRemoval(t *testing.T) {
 	if err := group.AddNode(node); err != nil {
 		t.Fatalf("AddNode() error = %v", err)
 	}
-	node.incActive()
+	rawConn := &scriptedConn{}
+	conn := registerTestConn(t, node, &trackedConn{Conn: rawConn, node: node})
 	if err := group.RemoveNode("a", time.Hour); err != nil {
 		t.Fatalf("RemoveNode() error = %v", err)
 	}
-	if manager.removed["node-a"] {
-		t.Fatalf("node removed while active")
-	}
-	node.decActive()
-	if err := group.GC(); err != nil {
-		t.Fatalf("GC() error = %v", err)
+	if rawConn.closed != 1 {
+		t.Fatalf("closed count = %d, want 1", rawConn.closed)
 	}
 	if !manager.removed["node-a"] {
-		t.Fatalf("node was not removed after active count reached zero")
+		t.Fatalf("node was not removed after active connections were cut")
 	}
+	_ = conn.Close()
 }
 
 func TestRemoveNodeKeepsSharedOutbound(t *testing.T) {
@@ -145,8 +143,7 @@ func TestActiveConnectionCount(t *testing.T) {
 	node := NewNodeState("a", "node-a", option.Outbound{})
 	left, right := net.Pipe()
 	defer right.Close()
-	node.incActive()
-	conn := &trackedConn{Conn: left, node: node}
+	conn := registerTestConn(t, node, &trackedConn{Conn: left, node: node})
 	if got := node.ActiveCount(); got != 1 {
 		t.Fatalf("active count = %d, want 1", got)
 	}
@@ -169,9 +166,8 @@ func TestTrackedConnReportsPreFirstByteEOFOnceAndCloses(t *testing.T) {
 	if err := group.AddNode(node); err != nil {
 		t.Fatalf("AddNode() error = %v", err)
 	}
-	node.incActive()
 	rawConn := &scriptedConn{reads: []scriptedRead{{err: io.EOF}}}
-	conn := &trackedConn{Conn: rawConn, group: group, node: node}
+	conn := registerTestConn(t, node, &trackedConn{Conn: rawConn, group: group, node: node})
 
 	if _, err := conn.Read(make([]byte, 1)); err != io.EOF {
 		t.Fatalf("Read() error = %v, want EOF", err)
@@ -204,12 +200,11 @@ func TestTrackedConnDoesNotReportEOFAfterResponseBytes(t *testing.T) {
 	if err := group.AddNode(node); err != nil {
 		t.Fatalf("AddNode() error = %v", err)
 	}
-	node.incActive()
 	rawConn := &scriptedConn{reads: []scriptedRead{
 		{data: []byte("x")},
 		{err: io.EOF},
 	}}
-	conn := &trackedConn{Conn: rawConn, group: group, node: node}
+	conn := registerTestConn(t, node, &trackedConn{Conn: rawConn, group: group, node: node})
 
 	buffer := make([]byte, 1)
 	if n, err := conn.Read(buffer); n != 1 || err != nil {
@@ -235,12 +230,11 @@ func TestTrackedConnBlacklistsAfterPreFirstByteFailures(t *testing.T) {
 	}
 
 	for i := 0; i < 3; i++ {
-		node.incActive()
-		conn := &trackedConn{
+		conn := registerTestConn(t, node, &trackedConn{
 			Conn:  &scriptedConn{reads: []scriptedRead{{err: io.EOF}}},
 			group: group,
 			node:  node,
-		}
+		})
 		if _, err := conn.Read(make([]byte, 1)); err != io.EOF {
 			t.Fatalf("Read(%d) error = %v, want EOF", i, err)
 		}
@@ -249,6 +243,77 @@ func TestTrackedConnBlacklistsAfterPreFirstByteFailures(t *testing.T) {
 	if got := blacklistedSnapshotIDs(group); !sameStrings(got, []string{"a"}) {
 		t.Fatalf("blacklisted nodes = %v, want a", got)
 	}
+}
+
+func TestTrackedConnCutsSiblingConnectionsWhenNodeBlacklisted(t *testing.T) {
+	group := NewDynamicGroup("group-auto", nil, Policy{SlowThreshold: 3, FailureBlacklistTTL: time.Minute})
+	node := NewNodeState("a", "node-a", option.Outbound{})
+	if err := group.AddNode(node); err != nil {
+		t.Fatalf("AddNode() error = %v", err)
+	}
+
+	siblingRaw := &scriptedConn{}
+	sibling := registerTestConn(t, node, &trackedConn{Conn: siblingRaw, group: group, node: node})
+	for i := 0; i < 3; i++ {
+		conn := registerTestConn(t, node, &trackedConn{
+			Conn:  &scriptedConn{reads: []scriptedRead{{err: io.EOF}}},
+			group: group,
+			node:  node,
+		})
+		if _, err := conn.Read(make([]byte, 1)); err != io.EOF {
+			t.Fatalf("Read(%d) error = %v, want EOF", i, err)
+		}
+	}
+
+	if siblingRaw.closed != 1 {
+		t.Fatalf("sibling closed count = %d, want 1", siblingRaw.closed)
+	}
+	if got := node.ActiveCount(); got != 0 {
+		t.Fatalf("active count = %d, want 0", got)
+	}
+	_ = sibling.Close()
+}
+
+func TestMarkNodeFailedClosesActiveConnections(t *testing.T) {
+	group := NewDynamicGroup("group-auto", nil, Policy{FailureBlacklistTTL: time.Minute})
+	node := NewNodeState("a", "node-a", option.Outbound{})
+	if err := group.AddNode(node); err != nil {
+		t.Fatalf("AddNode() error = %v", err)
+	}
+	rawConn := &scriptedConn{}
+	conn := registerTestConn(t, node, &trackedConn{Conn: rawConn, group: group, node: node})
+
+	if err := group.MarkNodeFailed("a", time.Minute, "dial failed"); err != nil {
+		t.Fatalf("MarkNodeFailed() error = %v", err)
+	}
+	if rawConn.closed != 1 {
+		t.Fatalf("closed count = %d, want 1", rawConn.closed)
+	}
+	if got := node.ActiveCount(); got != 0 {
+		t.Fatalf("active count = %d, want 0", got)
+	}
+	_ = conn.Close()
+}
+
+func TestDisableNodeClosesActiveConnections(t *testing.T) {
+	group := NewDynamicGroup("group-auto", nil, Policy{})
+	node := NewNodeState("a", "node-a", option.Outbound{})
+	if err := group.AddNode(node); err != nil {
+		t.Fatalf("AddNode() error = %v", err)
+	}
+	rawConn := &scriptedConn{}
+	conn := registerTestConn(t, node, &trackedConn{Conn: rawConn, group: group, node: node})
+
+	if err := group.DisableNode("a"); err != nil {
+		t.Fatalf("DisableNode() error = %v", err)
+	}
+	if rawConn.closed != 1 {
+		t.Fatalf("closed count = %d, want 1", rawConn.closed)
+	}
+	if got := node.ActiveCount(); got != 0 {
+		t.Fatalf("active count = %d, want 0", got)
+	}
+	_ = conn.Close()
 }
 
 func TestLeastLatencyUsesOnlyQualifiedCandidates(t *testing.T) {
@@ -536,6 +601,14 @@ func blacklistedSnapshotIDs(group *DynamicGroup) []string {
 		}
 	}
 	return ids
+}
+
+func registerTestConn[T nodeConnection](t *testing.T, node *NodeState, conn T) T {
+	t.Helper()
+	if !node.registerConnection(conn) {
+		t.Fatalf("registerConnection() = false")
+	}
+	return conn
 }
 
 type fakeOutboundManager struct {

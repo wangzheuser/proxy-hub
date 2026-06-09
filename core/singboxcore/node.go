@@ -33,16 +33,17 @@ type NodeState struct {
 	activeCount atomic.Int64
 	lastLatency atomic.Int64
 
-	mu               sync.RWMutex
-	enabled          bool
-	health           HealthState
-	blacklistedAt    time.Time
-	blacklistedUntil time.Time
-	blacklistReason  string
-	tombstoned       bool
-	tombstonedAt     time.Time
-	removeAfter      time.Time
-	lastError        string
+	mu                sync.RWMutex
+	enabled           bool
+	health            HealthState
+	blacklistedAt     time.Time
+	blacklistedUntil  time.Time
+	blacklistReason   string
+	tombstoned        bool
+	tombstonedAt      time.Time
+	removeAfter       time.Time
+	lastError         string
+	activeConnections map[nodeConnection]struct{}
 
 	leastLatencyCandidate      bool
 	leastLatencySlowCount      int
@@ -53,6 +54,10 @@ type NodeState struct {
 	leastLatencyProbeRunning   bool
 	leastLatencyStaleFallback  bool
 	leastLatencyLastProbeError string
+}
+
+type nodeConnection interface {
+	closeForNode(reason string) error
 }
 
 func NewNodeState(id, tag string, outbound option.Outbound) *NodeState {
@@ -105,12 +110,57 @@ func (n *NodeState) SetLatency(latency time.Duration) {
 	n.lastLatency.Store(latency.Milliseconds())
 }
 
-func (n *NodeState) incActive() {
-	n.activeCount.Add(1)
-}
-
 func (n *NodeState) decActive() {
 	n.activeCount.Add(-1)
+}
+
+func (n *NodeState) registerConnection(conn nodeConnection) bool {
+	if n == nil || conn == nil {
+		return false
+	}
+	now := time.Now()
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if !n.eligibleLocked(now) {
+		return false
+	}
+	if n.activeConnections == nil {
+		n.activeConnections = map[nodeConnection]struct{}{}
+	}
+	n.activeConnections[conn] = struct{}{}
+	n.activeCount.Add(1)
+	return true
+}
+
+func (n *NodeState) unregisterConnection(conn nodeConnection) {
+	if n == nil || conn == nil {
+		return
+	}
+	n.mu.Lock()
+	if n.activeConnections != nil {
+		delete(n.activeConnections, conn)
+		if len(n.activeConnections) == 0 {
+			n.activeConnections = nil
+		}
+	}
+	n.mu.Unlock()
+}
+
+func (n *NodeState) closeActiveConnections(reason string) int {
+	if n == nil {
+		return 0
+	}
+	n.mu.RLock()
+	connections := make([]nodeConnection, 0, len(n.activeConnections))
+	for conn := range n.activeConnections {
+		connections = append(connections, conn)
+	}
+	n.mu.RUnlock()
+
+	for _, conn := range connections {
+		_ = conn.closeForNode(reason)
+	}
+	return len(connections)
 }
 
 func (n *NodeState) Eligible(now time.Time) bool {
@@ -119,6 +169,10 @@ func (n *NodeState) Eligible(now time.Time) bool {
 	}
 	n.mu.RLock()
 	defer n.mu.RUnlock()
+	return n.eligibleLocked(now)
+}
+
+func (n *NodeState) eligibleLocked(now time.Time) bool {
 	if !n.enabled || n.tombstoned {
 		return false
 	}
@@ -207,6 +261,15 @@ func (n *NodeState) markFailed(ttl time.Duration, reason string, now time.Time) 
 	n.health = HealthDead
 }
 
+func (n *NodeState) blacklisted(now time.Time) bool {
+	if n == nil {
+		return false
+	}
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.health == HealthBlacklisted && (n.blacklistedUntil.IsZero() || n.blacklistedUntil.After(now))
+}
+
 func (n *NodeState) markTombstone(ttl time.Duration, now time.Time) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -290,9 +353,9 @@ func (n *NodeState) recordLeastLatencyProbeFailure(reason string, now time.Time,
 	}
 }
 
-func (n *NodeState) recordRuntimeTrafficFailure(reason string, now time.Time, policies ...probeFailurePolicy) {
+func (n *NodeState) recordRuntimeTrafficFailure(reason string, now time.Time, policies ...probeFailurePolicy) bool {
 	if n == nil {
-		return
+		return false
 	}
 	policy := probeFailurePolicy{}
 	if len(policies) > 0 {
@@ -300,6 +363,7 @@ func (n *NodeState) recordRuntimeTrafficFailure(reason string, now time.Time, po
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	wasBlacklisted := n.health == HealthBlacklisted && (n.blacklistedUntil.IsZero() || n.blacklistedUntil.After(now))
 	n.leastLatencyLastCheckedAt = now
 	n.leastLatencyFailureCount++
 	n.leastLatencyCandidate = false
@@ -315,6 +379,7 @@ func (n *NodeState) recordRuntimeTrafficFailure(reason string, now time.Time, po
 		}
 		n.blacklistReason = reason
 	}
+	return !wasBlacklisted && n.health == HealthBlacklisted && (n.blacklistedUntil.IsZero() || n.blacklistedUntil.After(now))
 }
 
 func (n *NodeState) markLeastLatencyProbeRunning(now time.Time) {

@@ -203,7 +203,7 @@ func NodeBlacklist(ctx context.Context, nodeID string, duration time.Duration) (
 		return nil, err
 	}
 
-	return globalNodeHealthBatcher.updateSnapshot(ctx, nodeID, func(snapshot *tables.ProxyNodeHealthTable, now time.Time) {
+	health, err := globalNodeHealthBatcher.updateSnapshot(ctx, nodeID, func(snapshot *tables.ProxyNodeHealthTable, now time.Time) {
 		until := now.Add(duration)
 		snapshot.Available = false
 		snapshot.Blacklisted = true
@@ -211,6 +211,11 @@ func NodeBlacklist(ctx context.Context, nodeID string, duration time.Duration) (
 		snapshot.ConsecutiveFailureCount = 0
 		snapshot.LastError = "manually blacklisted"
 	})
+	if err != nil {
+		return nil, err
+	}
+	syncRuntimeMappingsForBlacklistedNode(ctx, nodeID, "manual blacklist")
+	return health, nil
 }
 
 func recordNodeHealthResult(ctx context.Context, tx model.DBTx, nodeID string, record nodeHealthResultRecord) (*tables.ProxyNodeHealthTable, error) {
@@ -220,7 +225,14 @@ func recordNodeHealthResult(ctx context.Context, tx model.DBTx, nodeID string, r
 	if strings.TrimSpace(nodeID) == "" {
 		return nil, ErrNodeNotFound
 	}
-	return globalNodeHealthBatcher.recordProbeResult(ctx, nodeID, record)
+	health, err := globalNodeHealthBatcher.recordProbeResult(ctx, nodeID, record)
+	if err != nil {
+		return nil, err
+	}
+	if shouldSyncRuntimeForHealthBlacklist(health, record) {
+		syncRuntimeMappingsForBlacklistedNode(ctx, nodeID, record.Source)
+	}
+	return health, nil
 }
 
 func NodeTest(ctx context.Context, nodeID string, req ProxyTestRequest) (*ProxyTestResultDTO, error) {
@@ -407,6 +419,58 @@ func reviveNodeHealthIDs(ctx context.Context, tx model.DBTx, nodeIDs []string) e
 		return nil
 	}
 	return globalNodeHealthBatcher.reviveNodes(ctx, nodeIDs)
+}
+
+func shouldSyncRuntimeForHealthBlacklist(health *tables.ProxyNodeHealthTable, record nodeHealthResultRecord) bool {
+	if health == nil || !health.Blacklisted {
+		return false
+	}
+	cfg := normalizeHealthConfig(currentHealthConfig())
+	if cfg.FailureThreshold <= 0 || health.ConsecutiveFailureCount != cfg.FailureThreshold {
+		return false
+	}
+	switch strings.TrimSpace(record.Source) {
+	case nodeHealthSourceRuntimeTraffic:
+		return false
+	default:
+		return true
+	}
+}
+
+func syncRuntimeMappingsForBlacklistedNode(ctx context.Context, nodeID string, source string) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	mappingIDs, err := RuntimeAffectedMappingIDsByNodes(ctx, []string{nodeID})
+	if err != nil {
+		utils.Logger.Warn("节点进入黑名单后查询受影响本地端口失败",
+			zap.String("nodeId", nodeID),
+			zap.String("source", strings.TrimSpace(source)),
+			zap.Error(err),
+		)
+		return
+	}
+	if len(mappingIDs) == 0 {
+		return
+	}
+	if _, err := RuntimeSyncMappings(ctx, mappingIDs); err != nil {
+		utils.Logger.Warn("节点进入黑名单后同步运行时失败",
+			zap.String("nodeId", nodeID),
+			zap.String("source", strings.TrimSpace(source)),
+			zap.Strings("mappingIds", mappingIDs),
+			zap.Error(err),
+		)
+		return
+	}
+	utils.Logger.Warn("节点进入黑名单，已同步运行时并切换后续连接",
+		zap.String("nodeId", nodeID),
+		zap.String("source", strings.TrimSpace(source)),
+		zap.Strings("mappingIds", mappingIDs),
+	)
 }
 
 func recordRuntimeProbeResult(record singboxcore.ProbeRecord) {

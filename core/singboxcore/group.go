@@ -214,6 +214,7 @@ func (g *DynamicGroup) DisableNode(nodeID string) error {
 		return err
 	}
 	node.disable()
+	node.closeActiveConnections("node disabled")
 	g.ensureSelected()
 	return nil
 }
@@ -224,6 +225,7 @@ func (g *DynamicGroup) RemoveNode(nodeID string, ttl time.Duration) error {
 		return err
 	}
 	node.markTombstone(ttl, time.Now())
+	node.closeActiveConnections("node removed")
 	g.ensureSelected()
 	return g.GC()
 }
@@ -257,6 +259,9 @@ func (g *DynamicGroup) MarkNodeFailed(nodeID string, ttl time.Duration, reason s
 		return err
 	}
 	node.markFailed(ttl, reason, time.Now())
+	if !node.Eligible(time.Now()) {
+		node.closeActiveConnections("node failed")
+	}
 	g.ensureSelected()
 	return nil
 }
@@ -366,8 +371,13 @@ func (g *DynamicGroup) DialContext(ctx context.Context, network string, destinat
 		if policy.Strategy != BalanceManual {
 			g.setSelected(node.ID)
 		}
-		node.incActive()
-		return &trackedConn{Conn: conn, group: g, node: node}, nil
+		tracked := &trackedConn{Conn: conn, group: g, node: node}
+		if !node.registerConnection(tracked) {
+			_ = conn.Close()
+			joined = errors.Join(joined, ErrNoAvailableNode)
+			continue
+		}
+		return tracked, nil
 	}
 	if joined != nil {
 		return nil, joined
@@ -400,8 +410,13 @@ func (g *DynamicGroup) ListenPacket(ctx context.Context, destination M.Socksaddr
 		if policy.Strategy != BalanceManual {
 			g.setSelected(node.ID)
 		}
-		node.incActive()
-		return &trackedPacketConn{PacketConn: packetConn, node: node}, nil
+		tracked := &trackedPacketConn{PacketConn: packetConn, node: node}
+		if !node.registerConnection(tracked) {
+			_ = packetConn.Close()
+			joined = errors.Join(joined, ErrNoAvailableNode)
+			continue
+		}
+		return tracked, nil
 	}
 	if joined != nil {
 		return nil, joined
@@ -907,7 +922,11 @@ func (g *DynamicGroup) probeLeastLatencyNode(policy Policy, node *NodeState) {
 	outbound, ok := g.manager.Outbound(node.Tag)
 	if !ok {
 		now := time.Now()
+		wasBlacklisted := node.blacklisted(now)
 		node.recordLeastLatencyProbeFailure("outbound not found", now, probeFailurePolicy{threshold: policy.SlowThreshold, ttl: policy.FailureBlacklistTTL})
+		if !wasBlacklisted && node.blacklisted(now) {
+			node.closeActiveConnections("node blacklisted after probe failures")
+		}
 		g.emitProbeResult(policy, node, false, 0, "outbound not found", now)
 		return
 	}
@@ -917,7 +936,11 @@ func (g *DynamicGroup) probeLeastLatencyNode(policy Policy, node *NodeState) {
 	latency, err := urltest.URLTest(ctx, policy.ProbeURL, outbound)
 	now := time.Now()
 	if err != nil {
+		wasBlacklisted := node.blacklisted(now)
 		node.recordLeastLatencyProbeFailure(err.Error(), now, probeFailurePolicy{threshold: policy.SlowThreshold, ttl: policy.FailureBlacklistTTL})
+		if !wasBlacklisted && node.blacklisted(now) {
+			node.closeActiveConnections("node blacklisted after probe failures")
+		}
 		g.emitProbeResult(policy, node, false, 0, err.Error(), now)
 		return
 	}
@@ -949,11 +972,14 @@ func (g *DynamicGroup) emitTrafficFailure(node *NodeState, err error, checkedAt 
 		reason = "traffic failed before first response byte"
 	}
 	policy := g.policySnapshot()
-	node.recordRuntimeTrafficFailure(reason, checkedAt, probeFailurePolicy{
+	blacklisted := node.recordRuntimeTrafficFailure(reason, checkedAt, probeFailurePolicy{
 		threshold: policy.SlowThreshold,
 		ttl:       policy.FailureBlacklistTTL,
 	})
 	g.ensureSelected()
+	if blacklisted {
+		node.closeActiveConnections("node blacklisted after traffic failures")
+	}
 	if policy.TrafficFailureCallback == nil {
 		return
 	}
@@ -1007,17 +1033,45 @@ func (c *trackedConn) Write(b []byte) (int, error) {
 }
 
 func (c *trackedConn) Close() error {
+	return c.close("connection closed", true)
+}
+
+func (c *trackedConn) closeForNode(reason string) error {
+	return c.close(reason, true)
+}
+
+func (c *trackedConn) close(reason string, unregister bool) error {
+	_ = reason
 	if c == nil || c.Conn == nil {
 		return nil
 	}
 	c.closing.Store(true)
 	err := c.Conn.Close()
+	if unregister {
+		c.activeOnce.Do(func() {
+			if c.node != nil {
+				c.node.unregisterConnection(c)
+			}
+			if c.node != nil {
+				c.node.decActive()
+			}
+		})
+	}
+	return err
+}
+
+func (c *trackedConn) releaseActive() {
+	if c == nil {
+		return
+	}
 	c.activeOnce.Do(func() {
+		if c.node != nil {
+			c.node.unregisterConnection(c)
+		}
 		if c.node != nil {
 			c.node.decActive()
 		}
 	})
-	return err
 }
 
 func (c *trackedConn) reportPreFirstByteFailure(err error) {
@@ -1032,7 +1086,8 @@ func (c *trackedConn) reportPreFirstByteFailure(err error) {
 			return
 		}
 		checkedAt := time.Now()
-		_ = c.Close()
+		_ = c.close("pre-first-byte traffic failure", false)
+		c.releaseActive()
 		c.group.emitTrafficFailure(c.node, err, checkedAt)
 	})
 }
@@ -1081,9 +1136,20 @@ type trackedPacketConn struct {
 }
 
 func (c *trackedPacketConn) Close() error {
+	return c.closeForNode("packet connection closed")
+}
+
+func (c *trackedPacketConn) closeForNode(reason string) error {
+	_ = reason
+	if c == nil || c.PacketConn == nil {
+		return nil
+	}
 	err := c.PacketConn.Close()
 	c.once.Do(func() {
-		c.node.decActive()
+		if c.node != nil {
+			c.node.unregisterConnection(c)
+			c.node.decActive()
+		}
 	})
 	return err
 }
